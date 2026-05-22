@@ -83,14 +83,17 @@ RHYTHM_MIDI_KEYS = {
     "HH":  42,
 }
 
-# OPL rhythm drum source mapping.
-# op index:
-#   0 = first/raw modulator operator of that OPL channel
-#   1 = second/raw carrier operator of that OPL channel
+# Rhythm drum source mapping.
 #
-# BD는 ch6의 두 operator를 함께 사용.
-# HH/SD/TOM/CYM은 한 operator씩 분리 저장.
-
+# Source operator index:
+#   0 = raw modulator operator
+#   1 = raw carrier operator
+#
+# Bass drum is special:
+#   It keeps the full channel 6 2-op instrument.
+#
+# Other rhythm drums:
+#   The source operator is copied into the OPLI/WOPL modulator slot.
 RHYTHM_DRUM_SOURCE = {
     "BD":  (6, "both"),
     "HH":  (7, 0),
@@ -101,7 +104,7 @@ RHYTHM_DRUM_SOURCE = {
 
 
 # Common YM2413 / OPLL default instrument table.
-# 0번은 user/custom instrument.
+# Instrument 0 is the user/custom patch.
 OPLL_PATCHES = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
     [0x71, 0x61, 0x1E, 0x17, 0xD0, 0x78, 0x00, 0x17],
@@ -129,7 +132,7 @@ def read_vgm(path: Path) -> bytes:
         data = gzip.decompress(data)
 
     if data[:4] != b"Vgm ":
-        raise ValueError("This file is not VGM/VGZ file.")
+        raise ValueError("Not a VGM/VGZ file.")
 
     return data
 
@@ -142,8 +145,10 @@ def u32le(data: bytes, off: int) -> int:
 
 def get_vgm_data_offset(data: bytes) -> int:
     rel = u32le(data, 0x34)
+
     if rel:
         return 0x34 + rel
+
     return 0x40
 
 
@@ -350,7 +355,7 @@ def skip_vgm_command(data: bytes, pos: int, cmd: int, sample_pos: int):
         pos += 4
         return pos, sample_pos, False
 
-    raise ValueError(f"알 수 없는 VGM command: 0x{cmd:02X}")
+    raise ValueError(f"Unknown VGM command: 0x{cmd:02X}")
 
 
 class OPLChipState:
@@ -576,8 +581,6 @@ class OPLChipState:
         entry.append(self.fb_conn_byte(ch))
         entry.append(0)
 
-        # WOPL/OPLI operator order:
-        # op1 = Carrier1, op2 = Modulator1, op3/op4 unused
         entry.extend(self.op_to_bytes(car))
         entry.extend(self.op_to_bytes(mod))
         entry.extend(b"\x00" * 5)
@@ -587,49 +590,15 @@ class OPLChipState:
         return bytes(entry)
 
     def entry_rhythm_drum(self, kind: str, name: str) -> bytes:
-        """
-        Rhythm-mode percussion instrument entry.
-
-        BD:
-          ch6의 두 operator를 유지.
-
-        HH:
-          ch7 first operator, 즉 raw modulator만 저장.
-
-        SD:
-          ch7 second operator, 즉 raw carrier만 저장.
-
-        TOM:
-          ch8 first operator, 즉 raw modulator만 저장.
-
-        CYM:
-          ch8 second operator, 즉 raw carrier만 저장.
-
-        OPLI/WOPL operator order는:
-          op1 = Carrier1
-          op2 = Modulator1
-
-        그래서 raw carrier는 op1에,
-        raw modulator는 op2에 넣고 나머지는 0으로 둔다.
-        """
         if kind == "BD":
             ch, _ = RHYTHM_DRUM_SOURCE[kind]
             return self.entry_2op(ch, name, "BD")
 
         ch, op_i = RHYTHM_DRUM_SOURCE[kind]
-        op = self.channels[ch]["ops"][op_i]
+        source_op = self.channels[ch]["ops"][op_i]
 
         zero = b"\x00" * 5
-        op_bytes = self.op_to_bytes(op)
-
-        if op_i == 0:
-            # raw modulator -> OPLI op2
-            op1 = zero
-            op2 = op_bytes
-        else:
-            # raw carrier -> OPLI op1
-            op1 = op_bytes
-            op2 = zero
+        source_bytes = self.op_to_bytes(source_op)
 
         flags = RHYTHM_FLAGS.get(kind, 0)
         percussion_key = RHYTHM_MIDI_KEYS.get(kind, 0)
@@ -646,8 +615,16 @@ class OPLChipState:
         entry.append(self.fb_conn_byte(ch))
         entry.append(0)
 
-        entry.extend(op1)
-        entry.extend(op2)
+        # OPLI/WOPL operator order:
+        #   op1 = carrier slot
+        #   op2 = modulator slot
+        #   op3 = carrier slot for second voice
+        #   op4 = modulator slot for second voice
+        #
+        # For HH, SD, TOM, and CYM, the source operator is always stored
+        # into the modulator slot, even if the source came from a raw carrier.
+        entry.extend(zero)
+        entry.extend(source_bytes)
         entry.extend(zero)
         entry.extend(zero)
 
@@ -812,7 +789,6 @@ def entry_key_ignore_tl(entry: bytes, drum: bool, key_extra: bytes):
 
     data = bytearray(entry[32:])
 
-    # op1, op2, op3, op4 각각의 TL byte를 무시.
     for rel in (43 - 32, 48 - 32, 53 - 32, 58 - 32):
         if 0 <= rel < len(data):
             data[rel] &= 0xC0
@@ -872,7 +848,6 @@ def parse_vgm(data: bytes):
         cmd = data[pos]
         pos += 1
 
-        # OPLL / YM2413
         if cmd in (0x51, 0xA1):
             chip = chips["OPLL" if cmd == 0x51 else "OPLL_2"]
 
@@ -976,7 +951,6 @@ def parse_vgm(data: bytes):
                 val = data[pos + 1]
                 pos += 2
 
-            # Rhythm mode / percussion key bits
             if port == 0 and reg == 0xBD:
                 events = chip.rhythm_events(val)
 
@@ -1000,12 +974,10 @@ def parse_vgm(data: bytes):
                 chip.write(port, reg, val)
                 continue
 
-            # Melodic key-on
             if 0xB0 <= reg <= 0xB8:
                 ch = chip.key_write(port, reg, val)
 
                 if ch is not None:
-                    # 4-op의 secondary channel key-on은 primary에서 캡처하므로 무시.
                     if chip.is_4op_secondary(ch):
                         chip.write(port, reg, val)
                         continue
@@ -1028,16 +1000,14 @@ def parse_vgm(data: bytes):
                             key_extra=b"4OP",
                         )
                     else:
-                        # 보통 드럼은 0xBD event에서 잡히지만,
-                        # 리듬 모드 중 B0 key-on이 들어오는 특이한 VGM도 대비.
                         drum = bool(port == 0 and chip.rhythm_mode and 6 <= ch <= 8)
 
                         if drum:
                             name = f"{chip.name}_DRUM_CH{ch:02d}_{len(instruments):03d}"
-                            entry = chip.entry_2op(ch, name, "")
                         else:
                             name = f"{chip.name}_CH{ch:02d}_{len(instruments):03d}"
-                            entry = chip.entry_2op(ch, name, "")
+
+                        entry = chip.entry_2op(ch, name, "")
 
                         add_entry(
                             instruments,
@@ -1080,7 +1050,7 @@ def main():
     instruments = parse_vgm(data)
 
     if not instruments:
-        print("There are no OPL instruments.")
+        print("No OPL instruments found.")
         return
 
     output_dir = input_path.parent / f"{input_path.stem}_opli"
